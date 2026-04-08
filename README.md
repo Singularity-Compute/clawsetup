@@ -24,7 +24,23 @@ Without `--install-deps` you must already have **pnpm** and a working **Node** (
 
 With `--install-deps`, the script installs Node via nvm under **`~/.nvm`**. The script also runs `source ~/.bashrc` (via its internal setup) after the nvm installer and at other points so this session can see `nvm` / `pnpm` / `openclaw`.
 
+## Installation environment
+
+**Do not** run this installer from a **`sudo su`** shell, **`sudo -u`**, or any other pattern that **switches user / login context** partway through (nested `su`, a fresh login shell with a different `HOME`, and so on). That often breaks the install: `HOME`, `PATH`, nvm, and `~/.openclaw` no longer line up with the account you meant to use.
+
+**You can** run the script **as your normal user**, or **as root** in a direct, intentional way—but avoid “becoming another user” mid-session with `sudo su` / `su` tricks. If you run as a normal user and `--install-deps` needs package installs, the script uses `sudo` for `apt`/`dnf`/`yum` where required.
+
 ## Usage
+
+### One-liner (remote install)
+
+From a directory where you are happy for `.env` to be picked up (optional), or with `API_KEY` / `OPENCLAW_API_KEY` exported:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Singularity-Compute/clawsetup/main/clawsetup.sh | bash -s -- --install-deps && source ~/.bashrc
+```
+
+Omit **`--install-deps`** if you already have Node, npm, and pnpm set up the way you want (same rules as running the script locally).
 
 **Reload your shell profile after running the script** so your interactive shell (or new terminals) match what the script used. Either chain it when you invoke with `bash`, or run `source` on the next line:
 
@@ -40,7 +56,7 @@ source ~/.bashrc
 
 | Argument / option | Required | Default | Description |
 |-------------------|----------|---------|-------------|
-| `model_id` | Yes | — | Model id as exposed by the provider (e.g. `minimax/minimax-m2.5`). |
+| `model_id` | No | `minimax/minimax-m2.5` | Model id as exposed by the provider (e.g. `minimax/minimax-m2.5`). |
 | `api_key` | No* | — | API key for the inference endpoint. Omit to load from `.env` or to enter it when prompted. |
 | `context_window` | No | `196000` | Reported context window for the model in config. |
 | `max_tokens` | No | `16000` | Max output tokens setting in config. |

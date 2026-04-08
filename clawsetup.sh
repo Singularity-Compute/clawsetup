@@ -1,13 +1,28 @@
 #!/bin/bash
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Piped install (curl … | bash -s): fd 0 is the script; children used to inherit it and could
+# eat the rest of this file. Commands that might read stdin use </dev/null; optional: source
+# ~/.bashrc </dev/null when fd 0 is not a tty. Use -s so arguments after -- reach this script:
+#   curl -fsSL URL | bash -s -- --install-deps
+
+# When piped (curl ... | bash), BASH_SOURCE may be '-' or a non-file fd; use cwd for .env discovery.
+_script_path="${BASH_SOURCE[0]:-}"
+if [[ -z "$_script_path" || "$_script_path" == '-' || "$_script_path" == '/dev/stdin' || ! -f "$_script_path" ]]; then
+    SCRIPT_DIR="$PWD"
+else
+    SCRIPT_DIR="$(cd "$(dirname "$_script_path")" && pwd)"
+fi
+unset _script_path
+
+DEFAULT_MODEL_ID="minimax/minimax-m2.5"
 
 # Default values
 DEFAULT_CONTEXT_WINDOW=196000
 DEFAULT_MAX_TOKENS=16000
 
 MODEL_ID=""
-API_KEY=""
+# Preserve API_KEY if exported before running (e.g. API_KEY=x curl … | bash); do not wipe here.
+: "${API_KEY:=}"
 CONTEXT_WINDOW=$DEFAULT_CONTEXT_WINDOW
 MAX_TOKENS=$DEFAULT_MAX_TOKENS
 INSTALL_DEPS=false
@@ -15,13 +30,16 @@ ENV_FILE_ARG=""
 
 # Display usage
 usage() {
-    echo "Usage: $0 <model_id> [api_key] [context_window] [max_tokens] [options]"
+    echo "Usage: $0 [model_id] [api_key] [context_window] [max_tokens] [options]"
+    echo "One-liner:  curl -fsSL https://your.domain/clawsetup.sh | bash -s -- --install-deps"
+    echo "            (-s reads the script from the pipe; everything after -- is passed here.)"
+    echo "Fallback:   bash -c \"\$(curl -fsSL URL)\" -- args   (only if a rare environment breaks the pipe.)"
     echo "Example: $0 minimax/minimax-m2.5 sk-mykey123 196000 16000"
     echo "Example: $0 minimax/minimax-m2.5 --install-deps"
-    echo "         (API key from .env or interactive prompt)"
+    echo "         (API key from .env, API_KEY / OPENCLAW_API_KEY env, or prompt on /dev/tty)"
     echo ""
     echo "Positional arguments:"
-    echo "  model_id         Model identifier (required, e.g., minimax/minimax-m2.5)"
+    echo "  model_id         Model identifier (optional; default: $DEFAULT_MODEL_ID)"
     echo "  api_key          API key (optional if set via .env or entered when prompted)"
     echo "  context_window   Context window (optional; if api_key is omitted and this is"
     echo "                   numeric-only, it is treated as context_window — see README)"
@@ -69,47 +87,56 @@ done
 set -- "${POSITIONAL[@]}"
 
 if [ -z "${1:-}" ]; then
-    echo "Error: model_id is required"
-    echo ""
-    usage
+    MODEL_ID="$DEFAULT_MODEL_ID"
+else
+    MODEL_ID="$1"
+    shift
 fi
 
-MODEL_ID="$1"
-API_KEY=""
+if [[ "$MODEL_ID" == --install-* ]]; then
+    echo "Error: unknown option '$MODEL_ID'. Did you mean --install-deps? Put flags before other arguments." >&2
+    exit 1
+fi
+
 CONTEXT_WINDOW=$DEFAULT_CONTEXT_WINDOW
 MAX_TOKENS=$DEFAULT_MAX_TOKENS
 
-# Positional disambiguation: if api_key is omitted, the next numeric-only args can be context/max.
+# Remaining positionals: api_key, context_window, max_tokens (after optional model).
+# If api_key is omitted, numeric-only args can be context/max.
 case $# in
-    1)
+    0)
         ;;
-    2)
-        if [[ "$2" =~ ^[0-9]+$ ]]; then
-            CONTEXT_WINDOW="$2"
+    1)
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            CONTEXT_WINDOW="$1"
         else
-            API_KEY="$2"
+            API_KEY="$1"
         fi
         ;;
-    3)
-        if [[ "$2" =~ ^[0-9]+$ ]]; then
-            CONTEXT_WINDOW="$2"
-            MAX_TOKENS="$3"
+    2)
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            CONTEXT_WINDOW="$1"
+            MAX_TOKENS="$2"
         else
-            API_KEY="$2"
-            CONTEXT_WINDOW="$3"
+            API_KEY="$1"
+            CONTEXT_WINDOW="$2"
         fi
         ;;
     *)
-        API_KEY="$2"
-        [ -n "${3:-}" ] && CONTEXT_WINDOW="$3"
-        [ -n "${4:-}" ] && MAX_TOKENS="$4"
+        API_KEY="$1"
+        [ -n "${2:-}" ] && CONTEXT_WINDOW="$2"
+        [ -n "${3:-}" ] && MAX_TOKENS="$3"
         ;;
 esac
 
 source_bashrc() {
     if [ -f "$HOME/.bashrc" ]; then
         # shellcheck disable=SC1090
-        source "$HOME/.bashrc"
+        if [ -t 0 ]; then
+            source "$HOME/.bashrc"
+        else
+            source "$HOME/.bashrc" </dev/null
+        fi
     else
         echo "Warning: ~/.bashrc not found; nvm/pnpm may not be on PATH" >&2
     fi
@@ -155,8 +182,37 @@ extract_key_from_env_file() {
     return 1
 }
 
+# Prompt/read from the real terminal. Piped installs (cat/curl … | bash) use stdin for the
+# script; read -rs can still consume that stream on some setups — use stty + read on /dev/tty only.
+read_secret_api_key_from_tty() {
+    local tty=/dev/tty line saved stty_ok=0
+    [ -r "$tty" ] || return 1
+    saved=$(stty -g <"$tty" 2>/dev/null) && stty_ok=1
+    [ "$stty_ok" -eq 1 ] || return 1
+    if ! [ -t 0 ]; then
+        echo "Note: script input is a pipe; type your API key on the terminal below (not shown)." >&2
+    fi
+    printf 'Enter API key: ' >"$tty" || return 1
+    stty -echo <"$tty" 2>/dev/null || true
+    IFS= read -r line <"$tty" || line=""
+    if [ "$stty_ok" -eq 1 ]; then
+        stty "$saved" <"$tty" 2>/dev/null || stty sane <"$tty" 2>/dev/null || true
+    fi
+    printf '\n' >"$tty" || true
+    API_KEY="$line"
+    return 0
+}
+
+sanitize_api_key() {
+    API_KEY="${API_KEY//$'\r'/}"
+    API_KEY="${API_KEY//$'\n'/}"
+    API_KEY="${API_KEY#"${API_KEY%%[![:space:]]*}"}"
+    API_KEY="${API_KEY%"${API_KEY##*[![:space:]]}"}"
+}
+
 load_api_key() {
     if [ -n "$API_KEY" ]; then
+        sanitize_api_key
         return 0
     fi
     if [ -n "$ENV_FILE_ARG" ]; then
@@ -166,6 +222,7 @@ load_api_key() {
         fi
         if extract_key_from_env_file "$ENV_FILE_ARG"; then
             echo "Using API key from $ENV_FILE_ARG"
+            sanitize_api_key
             return 0
         fi
         echo "Error: API_KEY or OPENCLAW_API_KEY not set in $ENV_FILE_ARG" >&2
@@ -176,19 +233,30 @@ load_api_key() {
         [ -f "$f" ] || continue
         if extract_key_from_env_file "$f"; then
             echo "Using API key from $f"
+            sanitize_api_key
             return 0
         fi
     done
-    read -rs -p "Enter API key: " API_KEY
-    echo
+    if [ -n "${OPENCLAW_API_KEY:-}" ]; then
+        API_KEY="$OPENCLAW_API_KEY"
+        echo "Using API key from OPENCLAW_API_KEY"
+        sanitize_api_key
+        return 0
+    fi
+    if ! read_secret_api_key_from_tty; then
+        echo "Error: cannot read API key from TTY (piped install). Use --env-file, a .env file," >&2
+        echo "       or run:  export API_KEY=...  before:  cat script.sh | bash" >&2
+        exit 1
+    fi
+    sanitize_api_key
     if [ -z "$API_KEY" ]; then
         echo "Error: API key is required" >&2
         exit 1
     fi
 }
 
-source_bashrc
 load_api_key
+source_bashrc
 
 # Detect package manager and define install function
 detect_pkg_manager() {
@@ -244,9 +312,9 @@ if [ "$INSTALL_DEPS" = true ]; then
     install_system_packages
     LATEST=$(curl -s https://api.github.com/repos/nvm-sh/nvm/releases/latest | grep '"tag_name"' | awk -F'"' '{print $4}')
     curl -o- "https://raw.githubusercontent.com/nvm-sh/nvm/${LATEST}/install.sh" | bash && source_bashrc
-    nvm install node
-    npm install -g pnpm
-    pnpm setup
+    nvm install node </dev/null
+    npm install -g pnpm </dev/null
+    pnpm setup </dev/null
     export PNPM_HOME="$HOME/.local/share/pnpm"
     export PATH="$PNPM_HOME:$PATH"
     source_bashrc
@@ -259,12 +327,12 @@ source_bashrc
 approve_pending_devices() {
     echo "Checking for pending device approvals..."
     # Strip any non-JSON lines before the opening '{' (e.g. gateway warning messages)
-    DEVICES_JSON=$(openclaw devices list --json 2>/dev/null | sed -n '/^{/,$p')
+    DEVICES_JSON=$(openclaw devices list --json 2>/dev/null </dev/null | sed -n '/^{/,$p')
     PENDING_REQUEST_ID=$(echo "$DEVICES_JSON" | jq -r '.pending[0].requestId // empty' 2>/dev/null)
 
     if [ -n "$PENDING_REQUEST_ID" ]; then
         echo "Found pending device request: $PENDING_REQUEST_ID"
-        openclaw devices approve "$PENDING_REQUEST_ID"
+        openclaw devices approve "$PENDING_REQUEST_ID" </dev/null
         echo "Device approved successfully!"
     else
         echo "No pending device approvals found."
@@ -296,12 +364,12 @@ if ! command -v openclaw &> /dev/null; then
 
     cd "$OPENCLAW_REPO_DIR" || { echo "Error: failed to enter $OPENCLAW_REPO_DIR"; exit 1; }
 
-    pnpm install
-    pnpm ui:build
-    pnpm build
-    pnpm link --global
+    pnpm install </dev/null
+    pnpm ui:build </dev/null
+    pnpm build </dev/null
+    pnpm link --global </dev/null
 
-    openclaw onboard --install-daemon --non-interactive --accept-risk || true
+    openclaw onboard --install-daemon --non-interactive --accept-risk </dev/null || true
 
     # Approve pending devices immediately after onboarding
     approve_pending_devices
@@ -363,7 +431,7 @@ jq --arg model_id "$MODEL_ID" \
       }
     }
   }
-' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
+' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" </dev/null
 
 # Replace the original file
 mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
@@ -374,4 +442,4 @@ echo "Context Window: $CONTEXT_WINDOW"
 echo "Max Tokens: $MAX_TOKENS"
 
 echo "Starting openclaw dashboard..."
-openclaw dashboard
+openclaw dashboard </dev/null
